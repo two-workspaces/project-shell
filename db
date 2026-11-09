@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""db: find the databases in this Railway project and open the right client.
+
+  db                 list the connection URLs this shell can see
+  db NAME|N          open psql, mysql, redis-cli or mongosh on one of them
+  db dump NAME|N     dump it to ~/dumps (pg_dump, mysqldump or mongodump)
+  db url NAME|N      print the full URL (password included)
+
+URLs come from this service's own variables (add a reference variable such as
+DATABASE_URL=${{Postgres.DATABASE_URL}}) and, when RAILWAY_TOKEN holds a
+project token, from every other service in the environment.
+"""
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+SCHEMES = {
+    "postgres": "postgres", "postgresql": "postgres",
+    "mysql": "mysql",
+    "redis": "redis", "rediss": "redis",
+    "mongodb": "mongo", "mongodb+srv": "mongo",
+}
+URL_RE = re.compile(r"^(postgres|postgresql|mysql|redis|rediss|mongodb|mongodb\+srv)://", re.I)
+CACHE = "/tmp/.db-discovery.json"
+API = "https://backboard.railway.com/graphql/v2"
+
+
+def gql(query, variables):
+    headers = {"Content-Type": "application/json", "User-Agent": "railway-terminal-db"}
+    if os.environ.get("RAILWAY_TOKEN"):
+        headers["Project-Access-Token"] = os.environ["RAILWAY_TOKEN"]
+    else:
+        headers["Authorization"] = "Bearer " + os.environ["RAILWAY_API_TOKEN"]
+    body = json.dumps({"query": query, "variables": variables}).encode()
+    with urllib.request.urlopen(urllib.request.Request(API, body, headers), timeout=15) as r:
+        out = json.load(r)
+    if out.get("errors"):
+        raise RuntimeError(out["errors"][0].get("message", "Railway API error"))
+    return out["data"]
+
+
+def discover():
+    """Connection URLs of the other services, via the Railway API. Cached for a minute."""
+    if not (os.environ.get("RAILWAY_TOKEN") or os.environ.get("RAILWAY_API_TOKEN")):
+        return [], None
+    pid, eid = os.environ.get("RAILWAY_PROJECT_ID"), os.environ.get("RAILWAY_ENVIRONMENT_ID")
+    if not (pid and eid):
+        return [], "RAILWAY_PROJECT_ID / RAILWAY_ENVIRONMENT_ID not set (not running on Railway?)"
+    try:
+        st = os.stat(CACHE)
+        if time.time() - st.st_mtime < 60:
+            with open(CACHE) as f:
+                return json.load(f), None
+    except OSError:
+        pass
+    try:
+        services = gql("query($id:String!){project(id:$id){services{edges{node{id name}}}}}", {"id": pid})
+        found = []
+        me = os.environ.get("RAILWAY_SERVICE_ID")
+        for edge in services["project"]["services"]["edges"]:
+            svc = edge["node"]
+            if svc["id"] == me:
+                continue
+            vs = gql("query($p:String!,$e:String!,$s:String!){variables(projectId:$p,environmentId:$e,serviceId:$s)}",
+                     {"p": pid, "e": eid, "s": svc["id"]})["variables"] or {}
+            for k, v in sorted(vs.items()):
+                if isinstance(v, str) and URL_RE.match(v):
+                    found.append({"source": svc["name"], "var": k, "url": v})
+    except Exception as e:  # noqa: BLE001 - report, never crash the shell
+        return [], f"Railway API: {e}"
+    try:
+        fd = os.open(CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(found, f)
+    except OSError:
+        pass
+    return found, None
+
+
+def entries():
+    own = [{"source": "this service", "var": k, "url": v}
+           for k, v in sorted(os.environ.items()) if URL_RE.match(v or "")]
+    other, err = discover()
+    seen, out = set(), []
+    for e in own + other:
+        if e["url"] in seen:
+            continue
+        seen.add(e["url"])
+        u = urllib.parse.urlsplit(e["url"])
+        e["kind"] = SCHEMES[u.scheme.lower()]
+        e["public"] = "PUBLIC" in e["var"] or not (u.hostname or "").endswith(".railway.internal")
+        out.append(e)
+    # Private-network URLs first: they're faster and don't bill egress.
+    out.sort(key=lambda e: (e["public"], e["source"] != "this service", e["source"].lower(), e["var"]))
+    return out, err
+
+
+def masked(url):
+    u = urllib.parse.urlsplit(url)
+    if u.password:
+        netloc = u.netloc.replace(":" + u.password + "@", ":•••@", 1)
+        return urllib.parse.urlunsplit(u._replace(netloc=netloc))
+    return url
+
+
+def pick(es, key):
+    if key.isdigit() and 1 <= int(key) <= len(es):
+        return es[int(key) - 1]
+    k = key.lower()
+    k = {"pg": "postgres", "psql": "postgres", "postgresql": "postgres", "my": "mysql",
+         "mongodb": "mongo", "mongosh": "mongo", "redis-cli": "redis"}.get(k, k)
+    hits = [e for e in es if k in (e["source"].lower(), e["var"].lower(), e["kind"])]
+    hits = hits or [e for e in es if k in e["source"].lower() or k in e["var"].lower()]
+    if not hits:
+        sys.exit(f"db: nothing matches {key!r}; run `db` to list")
+    return hits[0]
+
+
+def show(es, err):
+    if not es:
+        print("No database URLs found.")
+        print("  Add one to this service's variables, e.g. DATABASE_URL=${{Postgres.DATABASE_URL}},")
+        print("  or set RAILWAY_TOKEN to a project token to find every database automatically.")
+    else:
+        w = max(len(f"{e['source']}/{e['var']}") for e in es)
+        for i, e in enumerate(es, 1):
+            tag = "" if not e["public"] else "  (public: bills egress)"
+            print(f"  {i:>2}  {e['kind']:<8} {(e['source'] + '/' + e['var']):<{w}}  {masked(e['url'])}{tag}")
+        print("\n  db N        open a client     db dump N   dump to ~/dumps")
+    if err:
+        print(f"  ({err})")
+
+
+def mysql_args(url):
+    u = urllib.parse.urlsplit(url)
+    os.environ["MYSQL_PWD"] = urllib.parse.unquote(u.password or "")
+    args = ["-h", u.hostname or "localhost", "-P", str(u.port or 3306), "-u", urllib.parse.unquote(u.username or "root")]
+    db = u.path.lstrip("/")
+    return args, db
+
+
+def connect(e):
+    url, kind = e["url"], e["kind"]
+    if kind == "postgres":
+        os.execvp("psql", ["psql", url])
+    if kind == "mysql":
+        args, db = mysql_args(url)
+        os.execvp("mysql", ["mysql", "--get-server-public-key", *args] + ([db] if db else []))
+    if kind == "redis":
+        os.execvp("redis-cli", ["redis-cli", "-u", url])
+    if kind == "mongo":
+        os.execvp("mongosh", ["mongosh", url])
+
+
+def dump(e, target=None):
+    url, kind = e["url"], e["kind"]
+    os.makedirs(os.path.expanduser("~/dumps"), exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", e["source"] if e["source"] != "this service" else e["var"]).strip("-").lower()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if kind == "postgres":
+        target = target or os.path.expanduser(f"~/dumps/{name}-{stamp}.dump")
+        print(f"pg_dump -Fc -> {target}   (restore: pg_restore -d URL --no-owner {target})")
+        os.execvp("pg_dump", ["pg_dump", "-Fc", "--no-owner", "-f", target, url])
+    if kind == "mysql":
+        target = target or os.path.expanduser(f"~/dumps/{name}-{stamp}.sql")
+        args, db = mysql_args(url)
+        print(f"mysqldump -> {target}   (restore: db {name} < {target})")
+        os.execvp("sh", ["sh", "-c", 'exec mysqldump --single-transaction --routines --triggers "$@" > "$0"',
+                         target, "--get-server-public-key", *args, *([db] if db else ["--all-databases"])])
+    if kind == "mongo":
+        target = target or os.path.expanduser(f"~/dumps/{name}-{stamp}.archive.gz")
+        print(f"mongodump -> {target}   (restore: mongorestore --uri URL --gzip --archive={target})")
+        os.execvp("mongodump", ["mongodump", "--uri", url, "--gzip", f"--archive={target}"])
+    sys.exit("db: dump supports Postgres, MySQL and MongoDB (for Redis, use `redis-cli -u URL --rdb FILE`)")
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    es, err = entries()
+    if not argv:
+        show(es, err)
+        return
+    if argv[0] == "dump" and len(argv) >= 2:
+        dump(pick(es, argv[1]), argv[2] if len(argv) > 2 else None)
+    elif argv[0] == "url" and len(argv) == 2:
+        print(pick(es, argv[1])["url"])
+    else:
+        connect(pick(es, argv[0]))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

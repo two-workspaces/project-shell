@@ -1,0 +1,8 @@
+
+  Terminal: a shell inside this project's private network
+  -------------------------------------------------------
+  db                list the databases this shell can reach; db N opens a client
+  psql mysql redis-cli mongosh   pg_dump mysqldump mongodump   railway
+  dig x.railway.internal   nc -zv host port   reach any service by its private name
+  ~/                persisted on the volume (history, dumps, dotfiles)
+
