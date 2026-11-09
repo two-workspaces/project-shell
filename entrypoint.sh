@@ -1,10 +1,9 @@
 #!/bin/bash
 set -e
 
-# /root is a Railway volume: empty on first boot. Seed dotfiles once.
-if [ ! -f /root/.terminal-seeded ]; then
-  cp -af /opt/skel/. /root/ && touch /root/.terminal-seeded
-fi
+# /root is a Railway volume: empty on first boot. Add any missing dotfiles, never
+# overwrite ones the user has edited.
+cp -an /opt/skel/. /root/
 mkdir -p /root/dumps
 
 # Without a password the shell would be open to anyone with the URL. Don't serve it,
@@ -53,6 +52,7 @@ nginx
 # hundreds of MB. Drop it for the home volume every 15 min.
 ( while sleep 900; do nice -n 19 drop-file-cache /root /tmp || true; done ) &
 
+cd /root
 TITLE="${RAILWAY_PROJECT_NAME:-terminal}${RAILWAY_ENVIRONMENT_NAME:+ / $RAILWAY_ENVIRONMENT_NAME}"
 echo "== terminal ready on :${PORT}"
 # Each browser tab attaches to the same tmux session, so work survives a closed tab.
