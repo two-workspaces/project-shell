@@ -68,7 +68,8 @@ def discover():
             vs = gql("query($p:String!,$e:String!,$s:String!){variables(projectId:$p,environmentId:$e,serviceId:$s)}",
                      {"p": pid, "e": eid, "s": svc["id"]})["variables"] or {}
             for k, v in sorted(vs.items()):
-                if isinstance(v, str) and URL_RE.match(v):
+                # Public URLs go through the TCP proxy and bill egress; the private one is enough.
+                if isinstance(v, str) and URL_RE.match(v) and "PUBLIC" not in k:
                     found.append({"source": svc["name"], "var": k, "url": v})
     except Exception as e:  # noqa: BLE001 - report, never crash the shell
         return [], f"Railway API: {e}"
@@ -151,7 +152,7 @@ def connect(e):
         args, db = mysql_args(url)
         os.execvp("mysql", ["mysql", "--get-server-public-key", *args] + ([db] if db else []))
     if kind == "redis":
-        os.execvp("redis-cli", ["redis-cli", "-u", url])
+        os.execvp("redis-cli", ["redis-cli", "--no-auth-warning", "-u", url])
     if kind == "mongo":
         os.execvp("mongosh", ["mongosh", url])
 
@@ -159,21 +160,22 @@ def connect(e):
 def dump(e, target=None):
     url, kind = e["url"], e["kind"]
     os.makedirs(os.path.expanduser("~/dumps"), exist_ok=True)
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", e["source"] if e["source"] != "this service" else e["var"]).strip("-").lower()
+    host = (urllib.parse.urlsplit(url).hostname or "db").split(".")[0]
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", e["source"] if e["source"] != "this service" else host).strip("-").lower()
     stamp = time.strftime("%Y%m%d-%H%M%S")
     if kind == "postgres":
         target = target or os.path.expanduser(f"~/dumps/{name}-{stamp}.dump")
-        print(f"pg_dump -Fc -> {target}   (restore: pg_restore -d URL --no-owner {target})")
+        print(f"pg_dump -Fc -> {target}   (restore: pg_restore -d URL --no-owner {target})", flush=True)
         os.execvp("pg_dump", ["pg_dump", "-Fc", "--no-owner", "-f", target, url])
     if kind == "mysql":
         target = target or os.path.expanduser(f"~/dumps/{name}-{stamp}.sql")
         args, db = mysql_args(url)
-        print(f"mysqldump -> {target}   (restore: db {name} < {target})")
+        print(f"mysqldump -> {target}   (restore: db {name} < {target})", flush=True)
         os.execvp("sh", ["sh", "-c", 'exec mysqldump --single-transaction --routines --triggers "$@" > "$0"',
                          target, "--get-server-public-key", *args, *([db] if db else ["--all-databases"])])
     if kind == "mongo":
         target = target or os.path.expanduser(f"~/dumps/{name}-{stamp}.archive.gz")
-        print(f"mongodump -> {target}   (restore: mongorestore --uri URL --gzip --archive={target})")
+        print(f"mongodump -> {target}   (restore: mongorestore --uri URL --gzip --archive={target})", flush=True)
         os.execvp("mongodump", ["mongodump", "--uri", url, "--gzip", f"--archive={target}"])
     sys.exit("db: dump supports Postgres, MySQL and MongoDB (for Redis, use `redis-cli -u URL --rdb FILE`)")
 
